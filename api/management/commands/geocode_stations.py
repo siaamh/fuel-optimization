@@ -1,228 +1,167 @@
 import csv
 import os
 import time
-
 import requests
-
 from django.core.management.base import BaseCommand
+from api.services.routing import RoutingService
 
-
-INPUT_FILE = r"C:\Users\ASUS\Downloads\fuel-prices-for-be-assessment - fuel-prices-for-be-assessment.csv"
-
-OUTPUT_FILE = "fuel_stations_geocoded.csv"
-
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-
-USER_AGENT = "fuel-optimization-assessment/1.0"
+NOMATIM_URL = "https://nominatim.openstreetmap.org/search"
+ORS_GEOCODE_URL = "https://api.openrouteservice.org/geocode/search/structured"
+USER_AGENT = "fuel-optimization/1.0"
 
 
 class Command(BaseCommand):
-    help = "Geocode fuel station CSV and save latitude/longitude"
+    help = "Geocode fuel station CSV with multi-strategy fallback"
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--input",
+            default="fuel_stations_geocoded.csv",
+            help="Input CSV path",
+        )
+        parser.add_argument(
+            "--output",
+            default="fuel_stations_geocoded.csv",
+            help="Output CSV path",
+        )
 
     def handle(self, *args, **options):
+        input_file = options["input"]
+        output_file = options["output"]
 
-        if not os.path.exists(INPUT_FILE):
-            self.stdout.write(
-                self.style.ERROR(
-                    f"Input file not found: {INPUT_FILE}"
-                )
-            )
+        if not os.path.exists(input_file):
+            self.stdout.write(self.style.ERROR(f"File not found: {input_file}"))
             return
 
-        self.stdout.write(
-            self.style.SUCCESS(
-                f"Reading {INPUT_FILE}..."
-            )
-        )
+        routing = RoutingService()
 
-        with open(
-            INPUT_FILE,
-            "r",
-            encoding="utf-8-sig",
-            newline="",
-        ) as infile:
-
-            reader = csv.DictReader(infile)
-
-            fieldnames = reader.fieldnames or []
-
-            # Add our new columns
-            fieldnames += [
-                "Latitude",
-                "Longitude",
-                "Geocoding Status",
-            ]
-
+        with open(input_file, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or [])
+            for col in ["Latitude", "Longitude", "Geocoding Status"]:
+                if col not in fieldnames:
+                    fieldnames.append(col)
             rows = list(reader)
 
-        self.stdout.write(
-            f"Found {len(rows)} stations."
-        )
+        self.stdout.write(f"Found {len(rows)} stations.")
 
-        # Load already processed stations if output exists
-        processed = {}
-
-        if os.path.exists(OUTPUT_FILE):
-
-            self.stdout.write(
-                "Existing output found. Resuming..."
-            )
-
-            with open(
-                OUTPUT_FILE,
-                "r",
-                encoding="utf-8-sig",
-                newline="",
-            ) as outfile:
-
-                existing_reader = csv.DictReader(outfile)
-
-                for row in existing_reader:
-                    station_id = row.get(
-                        "OPIS Truckstop ID"
-                    )
-
-                    if station_id:
-                        processed[station_id] = row
+        processed = self._load_existing(output_file)
 
         output_rows = []
 
-        for index, row in enumerate(rows, start=1):
+        for i, row in enumerate(rows, 1):
+            sid = row["OPIS Truckstop ID"]
 
-            station_id = row["OPIS Truckstop ID"]
-
-            # Skip already successfully processed stations
-            if station_id in processed:
-
-                existing = processed[station_id]
-
-                if (
-                    existing.get("Latitude")
-                    and existing.get("Longitude")
-                    and existing.get("Geocoding Status")
-                    == "success"
-                ):
-                    output_rows.append(existing)
-
-                    self.stdout.write(
-                        f"[{index}/{len(rows)}] "
-                        f"Skipping {station_id}"
-                    )
-
-                    continue
+            if sid in processed and processed[sid].get("Geocoding Status") == "success":
+                output_rows.append(processed[sid])
+                self.stdout.write(f"[{i}/{len(rows)}] Skipping {sid}")
+                continue
 
             address = row["Address"].strip()
             city = row["City"].strip()
             state = row["State"].strip()
 
-            query = (
-                f"{address}, "
-                f"{city}, "
-                f"{state}, USA"
+            self.stdout.write(f"[{i}/{len(rows)}] {row['Truckstop Name']} — {city}, {state}")
+
+            lat, lon, status = self._geocode_with_fallback(
+                routing, address, city, state
             )
 
-            self.stdout.write(
-                f"[{index}/{len(rows)}] "
-                f"Geocoding: {query}"
-            )
-
-            latitude = ""
-            longitude = ""
-            status = "failed"
-
-            try:
-
-                response = requests.get(
-                    NOMINATIM_URL,
-                    params={
-                        "q": query,
-                        "format": "json",
-                        "limit": 1,
-                        "countrycodes": "us",
-                    },
-                    headers={
-                        "User-Agent": USER_AGENT,
-                    },
-                    timeout=15,
-                )
-
-                response.raise_for_status()
-
-                results = response.json()
-
-                if results:
-
-                    latitude = results[0]["lat"]
-                    longitude = results[0]["lon"]
-                    status = "success"
-
-                    self.stdout.write(
-                        self.style.SUCCESS(
-                            f"  ✓ {latitude}, {longitude}"
-                        )
-                    )
-
-                else:
-
-                    status = "not_found"
-
-                    self.stdout.write(
-                        self.style.WARNING(
-                            "  ! Location not found"
-                        )
-                    )
-
-            except requests.RequestException as exc:
-
-                status = "error"
-
-                self.stdout.write(
-                    self.style.ERROR(
-                        f"  ✗ Request failed: {exc}"
-                    )
-                )
-
-            row["Latitude"] = latitude
-            row["Longitude"] = longitude
+            row["Latitude"] = lat
+            row["Longitude"] = lon
             row["Geocoding Status"] = status
-
             output_rows.append(row)
 
-            # Nominatim public service:
-            # keep requests slow and respectful.
-            time.sleep(1)
+            if status == "success":
+                self.stdout.write(self.style.SUCCESS(f"  -> {lat}, {lon}"))
+            else:
+                self.stdout.write(self.style.WARNING(f"  -> {status}"))
 
-            # Save progress after every station
-            self._save_rows(
-                output_rows,
-                fieldnames,
+            time.sleep(1.1)
+
+            self._save(output_rows, fieldnames, output_file)
+
+        self.stdout.write(self.style.SUCCESS(f"\nDone. Output: {output_file}"))
+
+    def _geocode_with_fallback(self, routing, address, city, state):
+        """Try multiple query strategies in order of specificity."""
+
+        queries = [
+            f"{address}, {city}, {state}, USA",
+            f"{city}, {state}, USA",
+            f"{address}, {state}, USA",
+        ]
+
+        for query in queries:
+            lat, lon = self._try_nominatim(query)
+            if lat:
+                return lat, lon, "success_nominatim"
+
+        ors_result = self._try_ors(routing, address, city, state)
+        if ors_result:
+            lat, lon = ors_result
+            return lat, lon, "success_ors"
+
+        return "", "", "not_found"
+
+    def _try_nominatim(self, query):
+        try:
+            resp = requests.get(
+                NOMATIM_URL,
+                params={"q": query, "format": "json", "limit": 1, "countrycodes": "us"},
+                headers={"User-Agent": USER_AGENT},
+                timeout=10,
             )
+            resp.raise_for_status()
+            data = resp.json()
+            if data:
+                return float(data[0]["lat"]), float(data[0]["lon"])
+        except requests.RequestException:
+            pass
+        return None, None
 
-        self.stdout.write(
-            self.style.SUCCESS(
-                "\nGeocoding completed."
+    def _try_ors(self, routing, address, city, state):
+        """Use ORS structured geocoding as last resort."""
+        if not routing.ors_api_key:
+            return None
+
+        try:
+            resp = requests.get(
+                ORS_GEOCODE_URL,
+                params={
+                    "api_key": routing.ors_api_key,
+                    "address": address,
+                    "locality": city,
+                    "region": state,
+                    "country": "US",
+                },
+                headers={"User-Agent": USER_AGENT},
+                timeout=10,
             )
-        )
+            resp.raise_for_status()
+            data = resp.json()
+            features = data.get("features", [])
+            if features:
+                coords = features[0]["geometry"]["coordinates"]
+                return coords[1], coords[0]  # ORS returns [lon, lat]
+        except requests.RequestException:
+            pass
 
-        self.stdout.write(
-            self.style.SUCCESS(
-                f"Output: {OUTPUT_FILE}"
-            )
-        )
+        return None
 
-    def _save_rows(self, rows, fieldnames):
+    def _load_existing(self, path):
+        processed = {}
+        if not os.path.exists(path):
+            return processed
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                sid = row.get("OPIS Truckstop ID")
+                if sid:
+                    processed[sid] = row
+        return processed
 
-        with open(
-            OUTPUT_FILE,
-            "w",
-            encoding="utf-8",
-            newline="",
-        ) as outfile:
-
-            writer = csv.DictWriter(
-                outfile,
-                fieldnames=fieldnames,
-            )
-
+    def _save(self, rows, fieldnames, path):
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
