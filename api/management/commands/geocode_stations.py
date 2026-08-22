@@ -3,6 +3,7 @@ import os
 import time
 
 import requests
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 from django.core.management.base import BaseCommand
 
