@@ -61,7 +61,13 @@ class OptimizeRouteView(APIView):
         # 4. Return combined response
         
         return Response({
-            
+            # "route": {
+            #     "start": start,
+            #     "finish": finish,
+            #     "distance_miles": route["distance_miles"],
+            #     "duration_minutes": route["duration_minutes"],
+            #     "geometry": route["geometry"],
+            # },
             "fuel_stops": result["stops"],
             "total_fuel_cost": result["total_cost"],
             "stations_checked": len(stations),
